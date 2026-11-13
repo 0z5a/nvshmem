@@ -24,21 +24,23 @@
 #include <list>
 #include <map>
 #include <mutex>
-#include <set>
 #include <string>
+#include <vector>
 
 #include "c_api/nvshmemx_api.h"
 #include "internal/host/nvmlwrap.h"
 #include "internal/host/nvshmemi_team.h"
+#include "internal/host/nvshmemi_pe_topology.hpp"
 #include "internal/host/nvshmem_internal.h"
 #include "internal/host/nvshmemi_region.h"
 #include "internal/host/nvshmem_nvtx.hpp"
-#include "internal/host/scope_guard.h"
+#include "internal/common/scope_guard.h"
 #include "internal/host_transport/region.hpp"
 #include "non_abi/device/common/nvshmemi_region_types.h"
 #include "internal/bootstrap_host_transport/nvshmemi_bootstrap_defines.h"
 #include "internal/host/nvshmemi_bootstrap_library.h"
 #include "non_abi/c/nvshmem_build_options.h"
+#include "internal/host/device_state_compat.h"
 #include "non_abi/device/common/logical_endpoint_types.h"
 
 #ifdef NVSHMEM_IBGDA_SUPPORT
@@ -60,34 +62,20 @@
 #include "internal/host/shared_memory.h"
 #include "internal/host/nvshmemi_symmetric_heap.hpp"
 #include "internal/host/nvshmemi_mem_transport.hpp"
+#include "internal/host/device_rma.h"
 
-extern __constant__ nvshmemi_device_host_state_t nvshmemi_device_state_d;
 struct nvshmemi_registered_state_info {
     int refcount;
     size_t state_size;
 };
 
 static std::map<void *, nvshmemi_registered_state_info> registered_device_states;
-static std::set<nvshmemx_device_lib_init_cb> registered_device_state_cb;
+static std::map<nvshmemx_device_lib_init_cb, size_t> registered_device_state_cb;
 static std::once_flag bootstrap_atexit_flag;
-
-static size_t nvshmemi_get_device_state_symbol_size() {
-    size_t state_size = sizeof(nvshmemi_device_host_state_t);
-    cudaError_t status = cudaGetSymbolSize(&state_size, nvshmemi_device_state_d);
-    if (status != cudaSuccess) {
-        state_size = sizeof(nvshmemi_device_host_state_t);
-        WARN(
-            "Unable to query nvshmemi_device_state_d symbol size: %s. Falling back to host "
-            "device state size %zu; compatibility with older device libraries may not be "
-            "guaranteed.",
-            cudaGetErrorString(status), state_size);
-    }
-
-    return state_size;
-}
 
 static void nvshmemi_init_debug(void);
 static void nvshmemi_init_msg(void);
+static int nvshmemi_setup_proxy_level(nvshmemi_state_t *state);
 int set_job_connectivity(nvshmemi_state_t *);
 
 struct nvshmemi_cuda_fn_table *nvshmemi_cuda_syms;
@@ -95,6 +83,7 @@ nvshmemi_state_t *nvshmemi_state;
 bootstrap_handle_t nvshmemi_boot_handle;
 nvshmemi_session_t *nvshmemi_default_session = nullptr;
 nvshmemi_pe_dist_t nvshmemi_pe_dist;
+nvshmemi_pe_topology_t nvshmemi_pe_topology;
 uint64_t *nvshmemi_host_hashes;
 int nvshmemi_init_counter = 0;
 nvshmem_options_t nvshmem_options;
@@ -102,7 +91,7 @@ int nvshmemi_cuda_driver_version;
 const char *p_err_str;
 int nvshmem_debug_level;
 uint64_t nvshmem_debug_mask = NVSHMEM_INIT;  // Default debug sub-system mask is INIT
-pthread_mutex_t nvshmem_debug_output_lock;
+pthread_mutex_t nvshmem_debug_output_lock = PTHREAD_MUTEX_INITIALIZER;
 bool nvshmemi_is_limited_mpg_run = 0;
 static uint64_t num_initialized_device_states = 0;
 static bool nvshmemi_is_device_state_ready;
@@ -225,7 +214,8 @@ int nvshmemi_update_device_state() {
     void *transport_device_ptr = NULL;
 
     while (!registered_device_state_cb.empty()) {
-        cb = *(registered_device_state_cb.begin());
+        cb = registered_device_state_cb.begin()->first;
+        const size_t state_size = registered_device_state_cb.begin()->second;
         registered_device_state_cb.erase(cb);
         cb(&device_ptr, &transport_device_ptr);
 
@@ -234,8 +224,7 @@ int nvshmemi_update_device_state() {
             continue;
         }
 
-        status = register_state_ptr(device_ptr, nvshmemi_get_device_state_symbol_size(),
-                                    transport_device_ptr);
+        status = register_state_ptr(device_ptr, state_size, transport_device_ptr);
 
         nvshmemi_init_counter++;
         device_ptr = NULL;
@@ -353,6 +342,35 @@ static int nvshmemi_transport_cap_support_amo(int cap) {
     return 0;
 }
 
+static void nvshmemi_warn_if_atomics_unavailable(nvshmemi_state_t *state) {
+    constexpr int atomic_capabilities =
+        NVSHMEM_TRANSPORT_CAP_MAP_GPU_ATOMICS | NVSHMEM_TRANSPORT_CAP_CPU_ATOMICS |
+        NVSHMEM_TRANSPORT_CAP_GPU_ATOMICS | NVSHMEM_TRANSPORT_CAP_LOGICAL_ENDPOINT;
+
+    for (int peer = 0; peer < state->npes; peer++) {
+        int capabilities = 0;
+        for (int transport_index = 0; transport_index < state->num_initialized_transports;
+             transport_index++) {
+            nvshmem_transport_t transport = state->transports[transport_index];
+            if (transport && transport->is_successfully_initialized &&
+                (state->transport_bitmap & (1 << transport_index))) {
+                capabilities |= transport->cap[peer];
+            }
+        }
+
+        if (!(capabilities & atomic_capabilities)) {
+            NVSHMEMI_WARN_PRINT(
+                "[%d] No atomic-capable transport is available to PE %d. Native GPU atomics "
+                "are unavailable and no remote atomic path was initialized "
+                "(NVSHMEM_REMOTE_TRANSPORT=%s). Atomic operations, including operations "
+                "targeting the calling PE, may fail. Enable a remote transport with atomic "
+                "support or use a topology with native GPU atomics support.\n",
+                state->mype, peer, nvshmemi_options.REMOTE_TRANSPORT);
+            return;
+        }
+    }
+}
+
 static void nvshmemi_refresh_selected_transports(nvshmemi_state_t *state) {
     for (int pe = 0; pe < state->npes; pe++) {
         state->selected_transport_for_rma[pe] = -1;
@@ -453,7 +471,6 @@ int nvshmemi_bootstrap(int flags, nvshmemx_init_attr_t *nvshmem_attr) {
     uint64_t *hostHash = NULL;
     int mype, npes;
     int mype_node = 0, npes_node = 0;
-    int num_nodes;
 
     bootstrap_attr_t attr = {};
     status = bootstrap_set_bootattr(flags, nvshmem_attr, (nvshmem_attr) ? &attr : NULL);
@@ -488,71 +505,22 @@ int nvshmemi_bootstrap(int flags, nvshmemx_init_attr_t *nvshmem_attr) {
     nvshmemi_boot_handle.mype_node = mype_node;
     nvshmemi_boot_handle.npes_node = npes_node;
 
-    // Check for same number of PEs on every node
-    // Use myHostHash value to indicate a given PE has been counted already
-    // This overwrites the hostHash values, but we don't them past this point
-
-    for (int i = 0; i < npes; i++) {
-        // If this host's node hasn't been counted yet, count it
-        if (hostHash[i] != myHostHash) {
-            const uint64_t peer_hash = hostHash[i];
-            int npes_peer_node = 0;
-            for (int j = i; j < npes; j++) {
-                if (peer_hash == hostHash[j]) {
-                    npes_peer_node++;
-                    hostHash[j] = myHostHash;
-                }
-            }
-            if (npes_peer_node != npes_node) {
-                char hostname[1024];
-                nvshmemu_gethostname(hostname, 1024);
-
-                NVSHMEMI_ERROR_JMP(
-                    status, NVSHMEMX_ERROR_INTERNAL, out,
-                    "NVSHMEM requires the same number of PEs on all nodes (%d PEs on %s)\n",
-                    npes_node, hostname);
-            }
-        }
-    }
+    nvshmemi_pe_topology.initialize(nvshmemi_host_hashes, npes);
 
     nvshmem_nvtx_set_thread_name(mype);
 
-    /* Set pe distribution type. First check for round robin distribution. Then check for block
-     * distribution. */
+    /* Algorithms using node/local-rank arithmetic require equal node sizes
+     * and the expected PE ordering. */
     nvshmemi_pe_dist = NVSHMEMI_PE_DIST_MISC;
-
-    if (npes_node != 0) {
-        if (npes % npes_node != 0) {
-            goto out;
-        }
-        num_nodes = npes / npes_node;
-    } else {
-        NVSHMEMI_ERROR_JMP(
-            status, NVSHMEMX_ERROR_INTERNAL, out,
-            "NVSHMEM hit the error of division by zero: npes_node == 0 what happen!?\n");
+    if (nvshmemi_pe_topology.is_block_distribution()) {
+        nvshmemi_pe_dist = NVSHMEMI_PE_DIST_BLOCK;
+        INFO(NVSHMEM_INIT, "PE distribution has been identified as NVSHMEMI_PE_DIST_BLOCK");
+    } else if (nvshmemi_pe_topology.is_roundrobin_distribution()) {
+        nvshmemi_pe_dist = NVSHMEMI_PE_DIST_ROUNDROBIN;
+        INFO(NVSHMEM_INIT, "PE distribution has been identified as NVSHMEMI_PE_DIST_ROUNDROBIN");
+    } else if (!nvshmemi_pe_topology.is_uniform()) {
+        INFO(NVSHMEM_INIT, "Non-uniform PEs per node: using general PE mappings");
     }
-
-    for (int i = 0; i < num_nodes; i++) {
-        for (int j = 0; j < npes_node; j++) {
-            if (nvshmemi_host_hashes[i * npes_node] != nvshmemi_host_hashes[i * num_nodes + j]) {
-                goto check_roundrobin_dist;
-            }
-        }
-    }
-    nvshmemi_pe_dist = NVSHMEMI_PE_DIST_BLOCK;
-    INFO(NVSHMEM_INIT, "PE distribution has been identified as NVSHMEMI_PE_DIST_BLOCK");
-    goto out;
-
-check_roundrobin_dist:
-    for (int i = 0; i < npes_node; i++) {
-        for (int j = 0; j < num_nodes; j++) {
-            if (nvshmemi_host_hashes[j * npes_node] != nvshmemi_host_hashes[i * num_nodes + j]) {
-                goto out;
-            }
-        }
-    }
-    nvshmemi_pe_dist = NVSHMEMI_PE_DIST_ROUNDROBIN;
-    INFO(NVSHMEM_INIT, "PE distribution has been identified as NVSHMEMI_PE_DIST_ROUNDROBIN");
 
 out:
     nvshmemi_device_state.pe_dist = nvshmemi_pe_dist;
@@ -824,14 +792,34 @@ int nvshmemi_teardown_handles(nvshmemi_state_t *state) {
     int status = 0;
     free(state->selected_transport_for_rma);
     free(state->selected_transport_for_amo);
+#if defined(NVSHMEM_CFT_HANDLES_SUPPORT) && CUDART_VERSION >= 13050
+    if (state->cft_scalar_staging) {
+        CUDA_RUNTIME_CHECK_GOTO(cudaFree(state->cft_scalar_staging), status, out);
+        state->cft_scalar_staging = nullptr;
+    }
+#endif
     for (int i = 0; i < nvshmemi_options.MAX_PEER_STREAMS; i++) {
         CUDA_RUNTIME_CHECK_GOTO(cudaStreamDestroy(state->custreams[i]), status, out);
         CUDA_RUNTIME_CHECK_GOTO(cudaEventDestroy(state->cuevents[i]), status, out);
     }
+#if defined(NVSHMEM_CFT_HANDLES_SUPPORT) && CUDART_VERSION >= 13050
+    for (int pe = 0; pe < state->npes; pe++) {
+        if (state->cft_fence_events && state->cft_fence_events[pe]) {
+            CUDA_RUNTIME_CHECK_GOTO(cudaEventDestroy(state->cft_fence_events[pe]), status, out);
+        }
+    }
+#endif
     CUDA_RUNTIME_CHECK_GOTO(cudaStreamDestroy(state->my_stream), status, out);
     free(state->custreams);
     free(state->cuevents);
     free(state->active_internal_streams);
+#if defined(NVSHMEM_CFT_HANDLES_SUPPORT) && CUDART_VERSION >= 13050
+    free(state->cft_fence_events);
+    free(state->cft_active_pes);
+    free(state->cft_fence_pending);
+    free(state->cft_active_internal_streams);
+    free(state->p2p_active_internal_streams);
+#endif
 out:
     return status;
 }
@@ -896,6 +884,27 @@ static int nvshmemi_setup_cuda_handles(nvshmemi_state_t *state) {
         (cudaEvent_t *)malloc(nvshmemi_options.MAX_PEER_STREAMS * sizeof(cudaEvent_t));
     state->active_internal_streams =
         (bool *)calloc(nvshmemi_options.MAX_PEER_STREAMS, sizeof(bool));
+#if defined(NVSHMEM_CFT_HANDLES_SUPPORT) && CUDART_VERSION >= 13050
+    state->cft_fence_events = (cudaEvent_t *)calloc(state->npes, sizeof(cudaEvent_t));
+    state->cft_active_pes = (bool *)calloc(state->npes, sizeof(bool));
+    state->cft_fence_pending = (bool *)calloc(state->npes, sizeof(bool));
+    state->cft_active_internal_streams =
+        (bool *)calloc(nvshmemi_options.MAX_PEER_STREAMS, sizeof(bool));
+    state->p2p_active_internal_streams =
+        (bool *)calloc(nvshmemi_options.MAX_PEER_STREAMS, sizeof(bool));
+    NVSHMEMI_NULL_ERROR_JMP(state->cft_fence_events, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+                            "Unable to allocate CFT fence events\n");
+    NVSHMEMI_NULL_ERROR_JMP(state->cft_active_pes, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+                            "Unable to allocate CFT active PE state\n");
+    NVSHMEMI_NULL_ERROR_JMP(state->cft_fence_pending, status, NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+                            "Unable to allocate CFT fence state\n");
+    NVSHMEMI_NULL_ERROR_JMP(state->cft_active_internal_streams, status,
+                            NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+                            "Unable to allocate CFT internal stream state\n");
+    NVSHMEMI_NULL_ERROR_JMP(state->p2p_active_internal_streams, status,
+                            NVSHMEMX_ERROR_OUT_OF_MEMORY, out,
+                            "Unable to allocate P2P internal stream state\n");
+#endif
     int leastPriority, greatestPriority;
     CUDA_RUNTIME_CHECK(cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
     for (int i = 0; i < nvshmemi_options.MAX_PEER_STREAMS; i++) {
@@ -905,6 +914,17 @@ static int nvshmemi_setup_cuda_handles(nvshmemi_state_t *state) {
         CUDA_RUNTIME_CHECK_GOTO(
             cudaEventCreateWithFlags(&state->cuevents[i], cudaEventDisableTiming), status, out);
     }
+#if defined(NVSHMEM_CFT_HANDLES_SUPPORT) && CUDART_VERSION >= 13050
+    for (int pe = 0; pe < state->npes; pe++) {
+        CUDA_RUNTIME_CHECK_GOTO(
+            cudaEventCreateWithFlags(&state->cft_fence_events[pe], cudaEventDisableTiming), status,
+            out);
+    }
+    CUDA_RUNTIME_CHECK_GOTO(
+        cudaMalloc(reinterpret_cast<void **>(&state->cft_scalar_staging),
+                   nvshmemi_options.MAX_PEER_STREAMS * sizeof(*state->cft_scalar_staging)),
+        status, out);
+#endif
 out:
     return status;
 }
@@ -919,18 +939,14 @@ static bool trimNewline(char *str) {
 
 /* Several NVSHMEM jobs on one node can query the MPS control daemon at the same time (for
  * example, MPI_Comm_split followed by one initialization per sub-communicator, or independent
- * jobs started in parallel). Concurrent nvidia-cuda-mps-control clients are not reliable, so
+ * jobs started in parallel). The local-rank order in nvshmemi_determine_mpg_support_level() only
+ * orders the queries of one job. Concurrent nvidia-cuda-mps-control clients are not reliable, so
  * queries from all NVSHMEM processes on the node are serialized with an advisory lock in the MPS
  * pipe directory, and a query that still fails is retried a few times. */
 #define NVSHMEMI_MPS_CONTROL_ATTEMPTS 3
 #define NVSHMEMI_MPS_CONTROL_RETRY_US 100000
 
 enum mps_control_result { MPS_CONTROL_OK, MPS_CONTROL_NO_DAEMON, MPS_CONTROL_FAILED };
-
-struct mps_percentage_result {
-    float percentage;
-    int ok;
-};
 
 static std::string mps_pipe_directory() {
     const char *pipe_dir = getenv("CUDA_MPS_PIPE_DIRECTORY");
@@ -1002,22 +1018,20 @@ static mps_control_result mps_control_query_once(const std::string &command,
 }
 
 /* Parses a positive number that spans the whole string. The daemon prints a server PID as an
- * integer and an active thread percentage with a fraction (e.g. "100.0"); as before, only the
- * integer part is used. */
-static bool parse_positive_number(const std::string &str, int *value) {
+ * integer and an active thread percentage with a fraction (e.g. "100.0"). */
+static bool parse_positive_number(const std::string &str, double *value) {
     char *end = NULL;
     errno = 0;
     double parsed = strtod(str.c_str(), &end);
     if (errno != 0 || end == str.c_str() || *end != '\0' || !(parsed > 0) || parsed > INT_MAX) {
         return false;
     }
-    *value = static_cast<int>(parsed);
+    *value = parsed;
     return true;
 }
 
-/* Returns true and the integer part of the answer if the command answered with a positive
- * number. */
-static bool mps_control_query_int(const std::string &command, int *value) {
+/* Returns true and the answer if the command answered with a positive number. */
+static bool mps_control_query_number(const std::string &command, double *value) {
     std::string line;
     for (int attempt = 0; attempt < NVSHMEMI_MPS_CONTROL_ATTEMPTS; attempt++) {
         if (attempt > 0) {
@@ -1040,108 +1054,93 @@ static bool mps_control_query_int(const std::string &command, int *value) {
 }
 
 static bool mpsServerRunning(int *serverPID) {
-    int pid = 0;
-    if (!mps_control_query_int("get_server_list", &pid)) {
+    double pid = 0;
+    if (!mps_control_query_number("get_server_list", &pid)) {
         return false;
     }
     if (serverPID) {
-        *serverPID = pid;
+        *serverPID = static_cast<int>(pid);
     }
     return true;
 }
 
-/* Collective over the bootstrap: the first PE on the node queries the control daemon and every
- * PE receives its result, so all PEs succeed or fail together. */
-static bool get_mps_server_active_thread_percentage(float *percentage) {
-    mps_percentage_result mine = {0.0f, 0};
-    if (nvshmemi_state->mype == nvshmemi_team_node->start) {
-        int serverPID = 0;
-        int result = 0;
-        if (mpsServerRunning(&serverPID) &&
-            mps_control_query_int("get_active_thread_percentage " + std::to_string(serverPID),
-                                  &result)) {
-            mine.percentage = result;
-            mine.ok = 1;
-        }
-    }
-
-    mps_percentage_result *all =
-        (mps_percentage_result *)malloc(sizeof(mps_percentage_result) * nvshmemi_state->npes);
-    if (all == NULL) {
+static bool get_mps_server_active_thread_percentage(int server_pid, float *percentage) {
+    double value = 0;
+    if (!mps_control_query_number("get_active_thread_percentage " + std::to_string(server_pid),
+                                  &value)) {
         return false;
     }
-    /* for lack of a better available bootstrap collective, using allgather */
-    int status = nvshmemi_boot_handle.allgather((void *)&mine, (void *)all, sizeof(mine),
-                                                &nvshmemi_boot_handle);
-    bool ok = (status == 0) && all[nvshmemi_team_node->start].ok;
-    if (ok) {
-        *percentage = all[nvshmemi_team_node->start].percentage;
-    }
-    free(all);
-    return ok;
+    *percentage = static_cast<float>(value);
+    return true;
 }
 
 static int nvshmemi_determine_mpg_support_level() {
+    // Only sharing groups need MPS. All PEs, including unshared GPUs and nodes
+    // without MPS, take the same bootstrap collectives and select one protocol.
+    struct mps_group_profile {
+        int running;
+        float percentage;
+        int query_ok;
+    };
+    mps_group_profile local = {0, 100.0f, 1};
     int status = 0;
-    bool is_mps_server_running = false;
-    if (nvshmemi_state->mype == nvshmemi_team_node->start) {
-        is_mps_server_running = mpsServerRunning(NULL);
+    // Concurrent control clients on a node can reject each other. Probe group
+    // leaders in local-rank order, allowing different MPS servers/settings for
+    // different GPUs while nodes perform their independent probes in parallel.
+    for (int local_rank = 0; local_rank < nvshmemi_pe_topology.max_pes_per_node; ++local_rank) {
+        if (nvshmemi_state->mype_node == local_rank && nvshmemi_team_same_gpu->size > 1 &&
+            nvshmemi_team_same_gpu->my_pe == 0) {
+            int server_pid = 0;
+            local.running = mpsServerRunning(&server_pid);
+            if (local.running) {
+                local.query_ok =
+                    get_mps_server_active_thread_percentage(server_pid, &local.percentage);
+            }
+        }
+        status = nvshmemi_boot_handle.barrier(&nvshmemi_boot_handle);
+        NVSHMEMI_NZ_ERROR_RET(status, NVSHMEMX_ERROR_INTERNAL,
+                              "barrier between MPS group probes failed\n");
     }
-    bool *scratch = (bool *)malloc(sizeof(bool) * nvshmemi_state->npes);
-    /* for lack of a better available bootstrap collective, using allagther */
-    status = nvshmemi_boot_handle.allgather((void *)&is_mps_server_running, (void *)scratch,
-                                            sizeof(bool), &nvshmemi_boot_handle);
-    is_mps_server_running = scratch[nvshmemi_team_node->start];
-    free(scratch);
-
-    if (!is_mps_server_running) {
-        INFO(NVSHMEM_INIT,
-             "Multiple PEs per GPU (MPG) detected but MPS is not running. "
-             "Hence limited MPG support is available");
-        nvshmemi_is_limited_mpg_run = 1;
-    } else {
-        float active_thread_percentage = 0;
-        bool success = get_mps_server_active_thread_percentage(&active_thread_percentage);
-        if (!success) {
-            NVSHMEMI_ERROR_PRINT(
-                "MPS is running, but its active thread percentage could not be read from "
-                "nvidia-cuda-mps-control\n");
+    std::vector<mps_group_profile> profiles(nvshmemi_state->npes);
+    status = nvshmemi_boot_handle.allgather(&local, profiles.data(), sizeof(local),
+                                            &nvshmemi_boot_handle);
+    NVSHMEMI_NZ_ERROR_RET(status, NVSHMEMX_ERROR_INTERNAL,
+                          "allgather of MPS group profiles failed\n");
+    for (const auto &profile : profiles) {
+        if (!profile.query_ok) {
+            NVSHMEMI_ERROR_PRINT("Failed to query an MPS server's active thread percentage\n");
             return NVSHMEMX_ERROR_INTERNAL;
         }
-        char *env = getenv("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE");
-        if (env) {
-            active_thread_percentage = atof(env);
-        }
-
-        float *active_percentages = (float *)malloc(sizeof(float) * nvshmemi_state->npes);
-        status = nvshmemi_boot_handle.allgather((void *)&active_thread_percentage,
-                                                (void *)active_percentages, sizeof(float),
-                                                &nvshmemi_boot_handle);
-        float total_percentage = 0;
-        for (int i = 0; i < nvshmemi_team_same_gpu->size; i += 1) {
-            total_percentage +=
-                *((float *)active_percentages +
-                  nvshmemi_team_translate_pe_to_team_world_wrap(nvshmemi_team_same_gpu, i));
-        }
-        if (total_percentage <= 100.0 ||
-            nvshmemi_options.IGNORE_CUDA_MPS_ACTIVE_THREAD_PERCENTAGE) {
-            nvshmemi_is_limited_mpg_run = 0;
-            INFO(NVSHMEM_INIT,
-                 "Multiple PEs per GPU (MPG) detected, MPS is also available, "
-                 "and either active thread percentages for PEs on the same GPU add "
-                 "up to be <= 100 or user has requested to ignore active thread percentage. "
-                 "Hence full MPG support is available. If active thread percentage "
-                 "adds to be more than 100, NVSHMEM synchronizing APIs might deadlock.");
-        } else {
-            nvshmemi_is_limited_mpg_run = 1;
-            INFO(NVSHMEM_INIT,
-                 "Multiple PEs per PU (MPG) detected, MPS is also available, "
-                 "but active thread percentages for PEs on the same GPU add "
-                 "up to be greater than 100. Hence limited MPG support is available");
-        }
-        free(active_percentages);
     }
-    return status;
+    const auto &group = profiles[nvshmemi_team_same_gpu->start];
+    float active_percentage = group.percentage;
+    if (const char *value = getenv("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE")) {
+        active_percentage = atof(value);
+    }
+    std::vector<float> active_percentages(nvshmemi_state->npes);
+    status = nvshmemi_boot_handle.allgather(&active_percentage, active_percentages.data(),
+                                            sizeof(float), &nvshmemi_boot_handle);
+    NVSHMEMI_NZ_ERROR_RET(status, NVSHMEMX_ERROR_INTERNAL,
+                          "allgather of MPS thread percentages failed\n");
+    float total_percentage = 0;
+    for (int i = 0; i < nvshmemi_team_same_gpu->size; ++i) {
+        total_percentage += active_percentages[nvshmemi_team_translate_pe_to_team_world_wrap(
+            nvshmemi_team_same_gpu, i)];
+    }
+    int full_support =
+        nvshmemi_team_same_gpu->size == 1 ||
+        (group.running &&
+         (total_percentage <= 100.0f || nvshmemi_options.IGNORE_CUDA_MPS_ACTIVE_THREAD_PERCENTAGE));
+    std::vector<int> full_support_all(nvshmemi_state->npes);
+    status = nvshmemi_boot_handle.allgather(&full_support, full_support_all.data(), sizeof(int),
+                                            &nvshmemi_boot_handle);
+    NVSHMEMI_NZ_ERROR_RET(status, NVSHMEMX_ERROR_INTERNAL,
+                          "allgather of MPG support levels failed\n");
+    nvshmemi_is_limited_mpg_run = std::any_of(full_support_all.begin(), full_support_all.end(),
+                                              [](int full) { return !full; });
+    INFO(NVSHMEM_INIT, "MPG synchronization support selected for all PEs: %s",
+         nvshmemi_is_limited_mpg_run ? "limited" : "full");
+    return NVSHMEMX_SUCCESS;
 }
 
 static int nvshmemi_setup_limited_mpg_support() {
@@ -1151,8 +1150,7 @@ static int nvshmemi_setup_limited_mpg_support() {
     cudaEvent_t event;
     int counter = 0;
 
-    /* Ensure supported MPS runs */
-    /* Do reduction to check to that each GPU has same stride and size for team_same_gpu */
+    /* Each slab belongs to its actual same-GPU group, independently of other groups. */
     int ret = snprintf(shm_name, 100, "mps_shm_%d", nvshmemi_team_same_gpu->start);
     if (ret < 0) {
         INFO(NVSHMEM_INIT, "snprintf failed");
@@ -1378,7 +1376,7 @@ int nvshmemi_common_init(nvshmemi_state_t *state, nvshmemx_init_attr_t *attr) {
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INVALID_VALUE, out,
                           "Unable to get device symbols.\n");
 
-    status = register_state_ptr(dev_state_ptr, nvshmemi_get_device_state_symbol_size(),
+    status = register_state_ptr(dev_state_ptr, sizeof(nvshmemi_device_host_state_t),
                                 transport_dev_state_ptr);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INVALID_VALUE, out,
                           "Invalid context pointer passed to nvshmemid_hostlib_init_attr.\n");
@@ -1419,6 +1417,11 @@ int nvshmemi_common_init(nvshmemi_state_t *state, nvshmemx_init_attr_t *attr) {
                           "nvshmemi_setup_transport failed \n");
     /* Static VIDMEM heap registration may prune MAP capabilities after IPC-open failures. */
     nvshmemi_refresh_selected_transports(state);
+    nvshmemi_warn_if_atomics_unavailable(state);
+
+    /* Agree on proxy level before device state setup. */
+    status = nvshmemi_setup_proxy_level(state);
+    NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "proxy level setup failed \n");
 
     nvshmemi_coll_common_cpu_check_ll128_availability();
 
@@ -1443,7 +1446,7 @@ int nvshmemi_common_init(nvshmemi_state_t *state, nvshmemx_init_attr_t *attr) {
         }
     }
 
-    status = nvshmemi_proxy_init(state, nvshmemi_proxy_level(state));
+    status = nvshmemi_proxy_init(state, state->proxy_level);
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "proxy initialization failed \n");
 
     nvshmemi_boot_handle.barrier(&nvshmemi_boot_handle);
@@ -1452,6 +1455,7 @@ int nvshmemi_common_init(nvshmemi_state_t *state, nvshmemx_init_attr_t *attr) {
 
     nvshmemi_boot_handle.barrier(&nvshmemi_boot_handle);
 
+    nvshmemi_is_limited_mpg_run = false;
     if (nvshmemi_is_mpg_run) {
         status = nvshmemi_determine_mpg_support_level();
         NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
@@ -1555,13 +1559,22 @@ int nvshmemid_hostlib_init_attr(int requested, int *provided, unsigned int boots
     }
 
     if (cb) {
-        registered_device_state_cb.emplace(cb);
+        const size_t state_size =
+            nvshmemi_device_state_size_for_version(nvshmem_device_lib_version);
+        if (state_size == 0) {
+            NVSHMEMI_ERROR_PRINT("Unknown device state layout for NVSHMEM %d.%d.%d\n",
+                                 nvshmem_device_lib_version.major, nvshmem_device_lib_version.minor,
+                                 nvshmem_device_lib_version.patch);
+            return NVSHMEMX_ERROR_INVALID_VALUE;
+        }
+        registered_device_state_cb.emplace(cb, state_size);
     } else {
         nvshmemi_init_counter++;
     }
 
     if (!nvshmemi_device_state.nvshmemi_is_nvshmem_bootstrapped) {
         nvshmemi_options_init();
+        nvshmemi_init_debug();
         if (nvshmemi_options.DEBUG_ATTACH_DELAY_provided) {
             printf("application set to sleep for %d seconds after debug init. PID: %d\n",
                    nvshmemi_options.DEBUG_ATTACH_DELAY, getpid());
@@ -1573,8 +1586,6 @@ int nvshmemid_hostlib_init_attr(int requested, int *provided, unsigned int boots
     NVTX_FUNC_RANGE_IN_GROUP(INIT);
 
     if (!nvshmemi_device_state.nvshmemi_is_nvshmem_bootstrapped) {
-        nvshmemi_init_debug();
-
         if (nvshmemi_options.DEBUG_ATTACH_DELAY) {
             INFO(NVSHMEM_INIT,
                  "sleeping for %d seconds. Now would be a good time to attach a debugger\n",
@@ -1681,6 +1692,15 @@ void nvshmemid_hostlib_finalize(void *device_ctx, void *transport_device_ctx) {
         NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
                               "Teams cleanup device synchronization failed \n");
         nvshmemi_region_host_reset();
+        const int device_rma_status = nvshmemi_device_rma_finalize();
+        if (device_rma_status) {
+            // Device work is synchronized above. Retain state that cannot be
+            // reclaimed safely, but do not strand peers in the teardown barrier.
+            WARN(
+                "Device RMA state cleanup failed (%d); continuing finalization without "
+                "reclaiming that allocation",
+                device_rma_status);
+        }
 
         /* barrier to ensure all previous ops are complete */
         nvshmemi_boot_handle.barrier(&nvshmemi_boot_handle);
@@ -1696,7 +1716,7 @@ void nvshmemid_hostlib_finalize(void *device_ctx, void *transport_device_ctx) {
         NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "Teams cleanup failed \n");
 
         /*cleaning up proxy*/
-        if (nvshmemi_proxy_level(nvshmemi_state)) {
+        if (nvshmemi_state->proxy_level != NVSHMEMI_PROXY_NONE) {
             status = nvshmemi_proxy_finalize(nvshmemi_state);
             NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "proxy cleanup failed \n");
         }
@@ -1748,6 +1768,8 @@ void nvshmemid_hostlib_finalize(void *device_ctx, void *transport_device_ctx) {
 #if defined(NVSHMEM_CFT_HANDLES_SUPPORT)
         if (nvshmemi_device_state.unicast_le_ids_) {
             CUDA_RUNTIME_CHECK(cudaFree(nvshmemi_device_state.unicast_le_ids_));
+            nvshmemi_device_state.unicast_le_ids_ = NULL;
+            unicast_le_ids_dptr = NULL;
         }
 #endif
 
@@ -1856,42 +1878,49 @@ static void nvshmemi_init_debug() {
      */
     const char *nvshmem_debug_filename = nvshmemi_options.DEBUG_FILE;
     if (nvshmem_debug_level > NVSHMEM_LOG_VERSION && nvshmemi_options.DEBUG_FILE_provided) {
-        int c = 0;
         char debugFn[PATH_MAX + 1] = "";
-        char *dfn = debugFn;
-        while (nvshmem_debug_filename[c] != '\0' && c < PATH_MAX) {
-            if (nvshmem_debug_filename[c++] != '%') {
-                *dfn++ = nvshmem_debug_filename[c - 1];
+        size_t input_pos = 0;
+        size_t output_pos = 0;
+        while (nvshmem_debug_filename[input_pos] != '\0' && output_pos < PATH_MAX) {
+            if (nvshmem_debug_filename[input_pos] != '%') {
+                debugFn[output_pos++] = nvshmem_debug_filename[input_pos++];
                 continue;
             }
-            switch (nvshmem_debug_filename[c++]) {
+            input_pos++;
+            switch (nvshmem_debug_filename[input_pos]) {
                 case '%':  // Double %
-                    *dfn++ = '%';
+                    debugFn[output_pos++] = '%';
+                    input_pos++;
                     break;
                 case 'h':  // %h = hostname
                     char hostname[1024];
                     nvshmemu_gethostname(hostname, 1024);
-                    dfn += snprintf(dfn, PATH_MAX, "%s", hostname);
+                    output_pos += snprintf(debugFn + output_pos, sizeof(debugFn) - output_pos, "%s",
+                                           hostname);
+                    input_pos++;
                     break;
                 case 'p':  // %p = pid
-                    dfn += snprintf(dfn, PATH_MAX, "%d", getpid());
+                    output_pos += snprintf(debugFn + output_pos, sizeof(debugFn) - output_pos, "%d",
+                                           getpid());
+                    input_pos++;
                     break;
                 default:  // Echo everything we don't understand
-                    *dfn++ = '%';
-                    *dfn++ = nvshmem_debug_filename[c - 1];
+                    debugFn[output_pos++] = '%';
+                    if (nvshmem_debug_filename[input_pos] != '\0' && output_pos < PATH_MAX) {
+                        debugFn[output_pos++] = nvshmem_debug_filename[input_pos++];
+                    }
                     break;
             }
         }
-        *dfn = '\0';
+        debugFn[PATH_MAX] = '\0';
         if (debugFn[0] != '\0') {
             FILE *file = fopen(debugFn, "w");
             if (file != NULL) {
-                INFO(NVSHMEM_ALL, "DEBUG file is '%s'", debugFn);
                 nvshmem_debug_file = file;
+                INFO(NVSHMEM_ALL, "DEBUG file is '%s'", debugFn);
             }
         }
     }
-    pthread_mutex_init(&nvshmem_debug_output_lock, NULL);
 
 #ifdef NVSHMEM_TRACE
     nvshmem_epoch = std::chrono::high_resolution_clock::now();
@@ -1915,30 +1944,30 @@ static void nvshmemi_init_msg(void) {
             int runtimeVersion, driverVersion;
             cudaError_t err;
 
-            printf("NVSHMEM configuration:\n");
+            nvshmem_debug_printf("NVSHMEM configuration:\n");
 
-            printf("  %-28s %d\n", "CUDA API", CUDA_VERSION);
+            nvshmem_debug_printf("  %-28s %d\n", "CUDA API", CUDA_VERSION);
 
             err = cudaRuntimeGetVersion(&runtimeVersion);
             if (err != cudaSuccess) {
                 runtimeVersion = -1;
             }
-            printf("  %-28s %d\n", "CUDA Runtime", runtimeVersion);
+            nvshmem_debug_printf("  %-28s %d\n", "CUDA Runtime", runtimeVersion);
 
             err = cudaDriverGetVersion(&driverVersion);
             if (err != cudaSuccess) {
                 driverVersion = -1;
             }
-            printf("  %-28s %d\n", "CUDA Driver", driverVersion);
+            nvshmem_debug_printf("  %-28s %d\n", "CUDA Driver", driverVersion);
 
-            printf("  %-28s %s %s\n", "Build Timestamp", __DATE__, __TIME__);
+            nvshmem_debug_printf("  %-28s %s %s\n", "Build Timestamp", __DATE__, __TIME__);
 
             char *build_vars = nvshmemu_wrap(NVSHMEM_BUILD_VARS, NVSHMEMI_WRAPLEN, "\t", 0);
-            printf("  %-28s\n\t%s\n", "Build Variables",
-                   build_vars ? build_vars : "Error wrapping build vars");
+            nvshmem_debug_printf("  %-28s\n\t%s\n", "Build Variables",
+                                 build_vars ? build_vars : "Error wrapping build vars");
             free(build_vars);
 
-            printf("\n");
+            nvshmem_debug_printf("\n");
         }
 
         if (nvshmemi_options.INFO) {
@@ -1952,26 +1981,44 @@ static void nvshmemi_init_msg(void) {
     }
 }
 
-int nvshmemi_proxy_level(nvshmemi_state_t *state) {
+static int nvshmemi_setup_proxy_level(nvshmemi_state_t *state) {
+    int requires_proxy = 0;
     for (int i = 0; i < state->num_initialized_transports; i++) {
         /* Slots are cleared when a transport fails to connect and is finalized. */
         if (!state->transports[i]) {
             continue;
         }
-        if (state->transports[i]->is_successfully_initialized) {
-            if (state->transports[i]->no_proxy) {
-                continue;
-            } else {
-                return NVSHMEMI_PROXY_FULL;
-            }
+        if (state->transports[i]->is_successfully_initialized && !state->transports[i]->no_proxy) {
+            requires_proxy = 1;
+            break;
         }
     }
 
-    if (nvshmemi_options.DISABLE_LOCAL_ONLY_PROXY) {
-        return NVSHMEMI_PROXY_NONE;
+    std::vector<int> peer_requires_proxy(state->npes);
+    int status = nvshmemi_boot_handle.allgather(&requires_proxy, peer_requires_proxy.data(),
+                                                sizeof(requires_proxy), &nvshmemi_boot_handle);
+    NVSHMEMI_NZ_ERROR_RET(status, NVSHMEMX_ERROR_INTERNAL,
+                          "allgather of transport proxy requirements failed \n");
+
+    int proxy_pes = std::count(peer_requires_proxy.begin(), peer_requires_proxy.end(), 1);
+    if (proxy_pes > 0) {
+        /* Full proxy setup includes symmetric allocations and a bootstrap barrier,
+         * so every PE must participate even if its own transports need no proxy. */
+        state->proxy_level = NVSHMEMI_PROXY_FULL;
+        if (proxy_pes != state->npes && state->mype == 0) {
+            NVSHMEMI_WARN_PRINT(
+                "Transport proxy requirements differ across PEs (%d of %d require a proxy). "
+                "Enabling the full proxy on all PEs.",
+                proxy_pes, state->npes);
+        }
+    } else {
+        state->proxy_level = nvshmemi_options.DISABLE_LOCAL_ONLY_PROXY ? NVSHMEMI_PROXY_NONE
+                                                                       : NVSHMEMI_PROXY_MINIMAL;
     }
 
-    return NVSHMEMI_PROXY_MINIMAL;
+    INFO(NVSHMEM_INIT, "[%d] local transport proxy requirement: %d, resolved proxy level: %d",
+         state->mype, requires_proxy, state->proxy_level);
+    return NVSHMEMX_SUCCESS;
 }
 
 int set_job_connectivity(nvshmemi_state_t *state) {
@@ -1979,15 +2026,23 @@ int set_job_connectivity(nvshmemi_state_t *state) {
     int *job_connectivity_all;
     bool proxy_ops_are_ordered = true;
     int gpu_remote_atomics = false;
+    bool mapped_peer_atomics = true;
 
     // determine job level connectivity among GPUs
     nvshmemi_job_connectivity = NVSHMEMI_JOB_GPU_LDST_ATOMICS;
     for (int i = 0; i < state->npes; i++) {
         int peer_connectivity = NVSHMEMI_JOB_GPU_PROXY;
         bool enforce_cst = false;
+        bool peer_mapped = false;
+        bool peer_atomics = false;
         // for each PE, pick the best connectivity of any transport
         for (int j = 0; j < state->num_initialized_transports; j++) {
             if (state->transports[j]) {
+                peer_mapped |=
+                    (state->transports[j]->cap[i] &
+                     (NVSHMEM_TRANSPORT_CAP_MAP_GPU_ST | NVSHMEM_TRANSPORT_CAP_MAP_GPU_LD)) != 0;
+                peer_atomics |=
+                    (state->transports[j]->cap[i] & NVSHMEM_TRANSPORT_CAP_MAP_GPU_ATOMICS) != 0;
                 if (state->transports[j]->cap[i] & NVSHMEM_TRANSPORT_CAP_MAP_GPU_ATOMICS) {
                     peer_connectivity = (int)NVSHMEMI_JOB_GPU_LDST_ATOMICS;
                 } else if (state->transports[j]->cap[i] &
@@ -2021,6 +2076,10 @@ int set_job_connectivity(nvshmemi_state_t *state) {
             }
         }
 
+        if (peer_mapped && !peer_atomics) {
+            mapped_peer_atomics = false;
+        }
+
         if ((peer_connectivity == NVSHMEMI_JOB_GPU_PROXY) && (enforce_cst)) {
             peer_connectivity = NVSHMEMI_JOB_GPU_PROXY_CST;
         }
@@ -2034,8 +2093,7 @@ int set_job_connectivity(nvshmemi_state_t *state) {
      * and cases where we have LDST + atomics over a remote transport elsewhere in the code.
      * This catches cases where the remote transport either does, or does not have a proxy.
      */
-    gpu_remote_atomics =
-        nvshmemi_proxy_level(state) == NVSHMEMI_PROXY_FULL ? true : gpu_remote_atomics;
+    gpu_remote_atomics = state->proxy_level == NVSHMEMI_PROXY_FULL ? true : gpu_remote_atomics;
     if (nvshmemi_job_connectivity == NVSHMEMI_JOB_GPU_LDST && gpu_remote_atomics) {
         nvshmemi_job_connectivity = NVSHMEMI_JOB_GPU_LDST_REMOTE_ATOMICS;
     }
@@ -2060,6 +2118,9 @@ int set_job_connectivity(nvshmemi_state_t *state) {
     }
     free(job_connectivity_all);
     nvshmemi_device_state.job_connectivity = nvshmemi_job_connectivity;
+    /* Pointer-addressed transport-policy routes issue system-scope atomics
+     * directly to a mapped peer only when every mapped peer supports them. */
+    nvshmemi_device_state.mapped_peer_atomics = mapped_peer_atomics;
 
 #ifdef NVSHMEM_BUILD_P2P_ONLY
     if (nvshmemi_job_connectivity > NVSHMEMI_JOB_GPU_LDST_ATOMICS) {
@@ -2121,7 +2182,7 @@ int nvshmemi_init_device_state(nvshmemi_state_t *state) {
         cudaMalloc(&heap_base_actual_array_dptr, (state->npes) * sizeof(void *)), status, out);
 
 #if defined(NVSHMEM_CFT_HANDLES_SUPPORT)
-    /* maintain 8 bytes per PE for unicast LE id <valid-4bytes|leId-4bytes> */
+    /* Maintain 8 bytes per PE for unicast LE id <valid-4bytes|leId-4bytes> */
     CUDA_RUNTIME_CHECK_GOTO(cudaMalloc(&unicast_le_ids_dptr, (state->npes) * sizeof(uint64_t)),
                             status, out);
 #endif
@@ -2153,12 +2214,11 @@ int nvshmemi_init_device_state(nvshmemi_state_t *state) {
                                                 sizeof(uint64_t) * state->npes, state->my_stream),
                                 status, out);
     }
-
 #endif
 
     CUDA_RUNTIME_CHECK_GOTO(cudaStreamSynchronize(state->my_stream), status, out);
 
-    nvshmemi_device_state.proxy = nvshmemi_proxy_level(state);
+    nvshmemi_device_state.proxy = state->proxy_level;
 
     if (nvshmemi_options.ASSERT_ATOMICS_SYNC) {
         nvshmemi_device_state.atomics_sync = 1;
@@ -2199,6 +2259,23 @@ int nvshmemi_init_device_state(nvshmemi_state_t *state) {
     nvshmemi_device_state.counted_operations_available =
         state->heap_obj->counted_operations_available();
     nvshmemi_device_state.unicast_le_ids_ = (void *)unicast_le_ids_dptr;
+    nvshmemi_device_state.has_cft_routed_peer = false;
+    if (const uint64_t *unicast_le_ids = state->heap_obj->get_unicast_le_ids()) {
+        const auto &peer_heap_bases = state->heap_obj->get_local_pe_bases();
+        for (int pe = 0; pe < state->npes; pe++) {
+            if (pe == state->mype || !IS_VALID_LE_ID(unicast_le_ids[pe])) {
+                continue;
+            }
+#if defined(NVSHMEM_PRIORITIZE_LOGICAL_ENDPOINT)
+            nvshmemi_device_state.has_cft_routed_peer = true;
+#else
+            nvshmemi_device_state.has_cft_routed_peer = peer_heap_bases[pe] == nullptr;
+#endif
+            if (nvshmemi_device_state.has_cft_routed_peer) {
+                break;
+            }
+        }
+    }
 #endif
 
     CUDA_RUNTIME_CHECK_GOTO(cudaStreamSynchronize(state->my_stream), status, out);
@@ -2325,6 +2402,8 @@ int nvshmemi_init_device_state(nvshmemi_state_t *state) {
     nvshmemi_device_state.region_slot_probe_limit = region_slot_probe_limit;
     region_slots_published = true;
 
+    status = nvshmemi_device_rma_init();
+    NVSHMEMI_NZ_ERROR_JMP(status, status, out, "Device RMA initialization failed\n");
     status = nvshmemi_update_device_state();
     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out,
                           "nvshmemi_update_device_state failed\n");
@@ -2332,6 +2411,10 @@ int nvshmemi_init_device_state(nvshmemi_state_t *state) {
 
 out:
     if (status) {
+        const int device_rma_status = nvshmemi_device_rma_finalize();
+        if (device_rma_status) {
+            status = device_rma_status;
+        }
         if (region_slots_published) {
             nvshmemi_device_state.region_slots = NULL;
             nvshmemi_device_state.region_active_count = NULL;
@@ -2350,6 +2433,8 @@ out:
 #if defined(NVSHMEM_CFT_HANDLES_SUPPORT)
         if (unicast_le_ids_dptr) {
             CUDA_RUNTIME_CHECK(cudaFree(unicast_le_ids_dptr));
+            unicast_le_ids_dptr = NULL;
+            nvshmemi_device_state.unicast_le_ids_ = NULL;
         }
 #endif
         if (nvshmemi_device_state.tma_smem_bases) {
